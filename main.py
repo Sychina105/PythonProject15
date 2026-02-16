@@ -6,13 +6,18 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import date, datetime, timedelta
+from sqlalchemy import and_, or_
+from fastapi import Request
+from fastapi import Query
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 
 # ================= CONFIG =================
 SECRET_KEY = "SECRET123"
 ALGORITHM = "HS256"
 
 app = FastAPI()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+bearer_scheme = HTTPBearer()
 
 engine = create_engine("sqlite:///app.db", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
@@ -87,6 +92,62 @@ class UserAchievement(Base):
     title = Column(String)
     earned_at = Column(String)
 
+class GoalUpdateBody(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    goalType: str | None = None
+    targetValue: int | None = None
+    unit: str | None = None
+    deadline: str | None = None
+    priority: int | None = None
+    status: str | None = None
+
+class GoalTemplateOut(BaseModel):
+    id: int
+    title: str
+    description: str
+    category: str
+    suggestedTarget: int | None = None
+    suggestedUnit: str | None = None
+
+# ================= TEMPLATES =================
+
+GOAL_TEMPLATES: list[GoalTemplateOut] = [
+    GoalTemplateOut(
+        id=1,
+        title="10 000 шагов в день",
+        description="Ежедневно проходить 10 000 шагов",
+        category="Здоровье",
+        suggestedTarget=10000,
+        suggestedUnit="шагов",
+    ),
+    GoalTemplateOut(
+        id=2,
+        title="Пробежать 5 км",
+        description="Пробежать дистанцию 5 км",
+        category="Спорт",
+        suggestedTarget=5,
+        suggestedUnit="км",
+    ),
+    GoalTemplateOut(
+        id=3,
+        title="Прочитать 12 книг за год",
+        description="Постепенно читать книги в течение года",
+        category="Образование",
+        suggestedTarget=12,
+        suggestedUnit="книг",
+    ),
+    GoalTemplateOut(
+        id=4,
+        title="Медитация 30 дней",
+        description="Держать привычку медитации 30 дней подряд",
+        category="Психология",
+        suggestedTarget=30,
+        suggestedUnit="дней",
+    ),
+]
+
+
 
 
 # ================= SCHEMAS =================
@@ -119,6 +180,7 @@ class GoalCreateBody(BaseModel):
     unit: str | None = None
     deadline: str | None = None
     priority: int = 3
+    status: str = "ACTIVE"
 
 class GoalStatusBody(BaseModel):
     status: str
@@ -131,6 +193,12 @@ class Friend(Base):
 
 Base.metadata.create_all(engine)
 
+class HabitUpdateBody(BaseModel):
+    title: str | None = None
+    periodDays: int | None = None
+    timesPerPeriod: int | None = None
+
+
 # ================= AUTH UTILS =================
 def hash_password(password: str):
     return pwd_context.hash(password)
@@ -141,12 +209,16 @@ def verify_password(password: str, hash_: str):
 def create_token(user_id: int):
     return jwt.encode({"user_id": user_id}, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user_id(token: str = Depends(oauth2_scheme)):
+def get_current_user_id(
+    creds: HTTPAuthorizationCredentials = Depends(bearer_scheme)
+):
+    token = creds.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return int(payload["user_id"])
     except (JWTError, KeyError):
         raise HTTPException(status_code=401, detail="Invalid token")
+
 
 # ================= GAMIFICATION =================
 HABIT_STREAK_THRESHOLDS = [7, 14, 30, 60, 180, 360]
@@ -204,10 +276,109 @@ def login(body: LoginBody, db: Session = Depends(get_db)):
         raise HTTPException(401, "Invalid credentials")
     return {"token": create_token(u.id)}
 
+
+
+
+
+
+
+@app.put("/goals/{goal_id}")
+def update_goal(goal_id: int, body: GoalUpdateBody,
+                user_id: int = Depends(get_current_user_id),
+                db: Session = Depends(get_db)):
+    g = db.query(Goal).filter_by(id=goal_id, user_id=user_id).first()
+    if not g:
+        raise HTTPException(404, "Goal not found")
+
+    prev_status = g.status
+
+    if body.title is not None: g.title = body.title
+    if body.description is not None: g.description = body.description
+    if body.goalType is not None: g.goal_type = body.goalType
+    if body.targetValue is not None: g.target_value = body.targetValue
+    if body.unit is not None: g.unit = body.unit
+    if body.deadline is not None: g.deadline = body.deadline
+    if body.priority is not None: g.priority = body.priority
+    if body.status is not None: g.status = body.status
+
+    db.commit()
+
+    # Награды за DONE (если статус стал DONE через редактирование)
+    if prev_status != "DONE" and g.status == "DONE":
+        done_count = db.query(Goal).filter_by(user_id=user_id, status="DONE").count()
+        for n in GOAL_DONE_THRESHOLDS:
+            if done_count >= n:
+                ensure_achievement(db, user_id, f"GOAL_DONE_{n}", f"Завершено {n} целей")
+        db.commit()
+
+    db.refresh(g)
+    return goal_to_dto(g)
+
+from fastapi import Query
+#проверка что все работает
+@app.post("/debug/habits/{habit_id}/add_streak")
+def debug_add_habit_streak(
+    habit_id: int,
+    n: int = Query(7, ge=1, le=365),
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    # 1) проверяем, что привычка твоя
+    h = db.query(Habit).filter_by(id=habit_id, user_id=user_id).first()
+    if not h:
+        raise HTTPException(404, "Habit not found")
+
+    # 2) добавляем чек-ины за последние n дней (включая сегодня)
+    today = date.today()
+    created = 0
+    for i in range(n):
+        d = (today - timedelta(days=i)).isoformat()
+        exists = db.query(HabitCheckin).filter_by(habit_id=habit_id, date=d).first()
+        if not exists:
+            db.add(HabitCheckin(habit_id=habit_id, date=d, value=None))
+            created += 1
+
+    db.commit()
+
+    # 3) пересчитываем стрик и выдаём награды
+    dates = [c.date for c in db.query(HabitCheckin).filter_by(habit_id=habit_id).all()]
+    streak = compute_current_streak(dates)
+
+    for t in HABIT_STREAK_THRESHOLDS:
+        if streak >= t:
+            ensure_achievement(db, user_id, f"HABIT_STREAK_{t}", f"{t} дней подряд")
+    db.commit()
+
+    return {"ok": True, "habitId": habit_id, "createdCheckins": created, "currentStreak": streak}
+#проверка что все работает
+
+
+@app.put("/habits/{habit_id}")
+def update_habit(habit_id: int, body: HabitUpdateBody,
+                 user_id: int = Depends(get_current_user_id),
+                 db: Session = Depends(get_db)):
+    h = db.query(Habit).filter_by(id=habit_id, user_id=user_id).first()
+    if not h:
+        raise HTTPException(404, "Habit not found")
+
+    if body.title is not None: h.title = body.title
+    if body.periodDays is not None: h.period_days = body.periodDays
+    if body.timesPerPeriod is not None: h.times_per_period = body.timesPerPeriod
+
+    db.commit()
+    db.refresh(h)
+
+    # ✅ важно: возвращаем camelCase DTO
+    return habit_to_dto(h)
+
+
+
 # ================= HABITS =================
 @app.get("/habits")
 def get_habits(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return db.query(Habit).filter_by(user_id=user_id).all()
+    habits = db.query(Habit).filter_by(user_id=user_id).all()
+    return [habit_to_dto(h) for h in habits]
+
 
 @app.post("/habits")
 def create_habit(body: HabitCreateBody, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -220,7 +391,7 @@ def create_habit(body: HabitCreateBody, user_id: int = Depends(get_current_user_
     db.add(h)
     db.commit()
     db.refresh(h)
-    return h
+    return habit_to_dto(h)
 
 @app.post("/habits/{habit_id}/checkin")
 def checkin(habit_id: int, body: CheckinBody, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -239,12 +410,68 @@ def checkin(habit_id: int, body: CheckinBody, user_id: int = Depends(get_current
     return {"ok": True, "currentStreak": streak}
 
 # ================= GOALS =================
+
+def goal_to_dto(g: Goal) -> dict:
+    return {
+        "id": g.id,
+        "title": g.title,
+        "description": g.description,
+        "goalType": g.goal_type,
+        "targetValue": g.target_value,
+        "unit": g.unit,
+        "progressValue": g.progress_value,
+        "deadline": g.deadline,
+        "priority": g.priority,
+        "status": g.status,
+    }
+
+def habit_to_dto(h: Habit) -> dict:
+    return {
+        "id": h.id,
+        "title": h.title,
+        "periodDays": h.period_days,
+        "timesPerPeriod": h.times_per_period,
+    }
+
+
 @app.get("/goals")
-def get_goals(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return db.query(Goal).filter_by(user_id=user_id).all()
+def get_goals(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    goals = db.query(Goal).filter_by(user_id=user_id).all()
+    return [goal_to_dto(g) for g in goals]
 
 @app.post("/goals")
-def create_goal(body: GoalCreateBody, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+async def create_goal(
+    request: Request,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    # 1) RAW body
+    raw_bytes = await request.body()
+    raw_text = raw_bytes.decode("utf-8", errors="ignore")
+    print("RAW:", raw_text)
+
+    # 2) JSON dict
+    try:
+        data = await request.json()
+    except Exception as e:
+        print("JSON PARSE ERROR:", repr(e))
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    print("JSON:", data)
+
+    # 3) Pydantic parse
+    try:
+        body = GoalCreateBody(**data)
+    except Exception as e:
+        print("Pydantic ERROR:", repr(e))
+        raise HTTPException(status_code=422, detail=str(e))
+
+    print("PARSED:", body.dict())
+
+    # 4) DB insert
     g = Goal(
         user_id=user_id,
         title=body.title,
@@ -253,29 +480,16 @@ def create_goal(body: GoalCreateBody, user_id: int = Depends(get_current_user_id
         target_value=body.targetValue,
         unit=body.unit,
         deadline=body.deadline,
-        priority=body.priority
+        priority=body.priority,
+        status=body.status,
     )
+
     db.add(g)
     db.commit()
     db.refresh(g)
-    return g
 
-@app.put("/goals/{goal_id}/status")
-def set_goal_status(goal_id: int, body: GoalStatusBody, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    g = db.query(Goal).filter_by(id=goal_id, user_id=user_id).first()
-    if not g:
-        raise HTTPException(404)
-    prev = g.status
-    g.status = body.status
-    db.commit()
-
-    if prev != "DONE" and body.status == "DONE":
-        done_count = db.query(Goal).filter_by(user_id=user_id, status="DONE").count()
-        for n in GOAL_DONE_THRESHOLDS:
-            if done_count >= n:
-                ensure_achievement(db, user_id, f"GOAL_DONE_{n}", f"Завершено {n} целей")
-        db.commit()
-    return {"ok": True}
+    # !!! важно: возвращаем DTO (camelCase), а не ORM модель
+    return goal_to_dto(g)
 
 # ================= PROFILE =================
 @app.get("/profile")
@@ -395,5 +609,162 @@ def remove_friend(friend_id: int, user_id: int = Depends(get_current_user_id), d
     db.delete(row)
     db.commit()
     return {"ok": True}
+
+@app.get("/friends/incoming")
+def friends_incoming(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    # те, кто добавил тебя, но ты ещё не добавил их
+    incoming = db.query(Friend).filter(Friend.friend_id == user_id).all()
+    result = []
+    for f in incoming:
+        me_to_him = db.query(Friend).filter(Friend.user_id == user_id, Friend.friend_id == f.user_id).first()
+        if me_to_him:
+            continue  # уже взаимка
+        u = db.query(User).filter(User.id == f.user_id).first()
+        if u:
+            result.append({"id": u.id, "name": u.name})
+    return result
+
+
+@app.get("/friends/outgoing")
+def friends_outgoing(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    # ты добавил, но тебя ещё не добавили
+    outgoing = db.query(Friend).filter(Friend.user_id == user_id).all()
+    result = []
+    for f in outgoing:
+        him_to_me = db.query(Friend).filter(Friend.user_id == f.friend_id, Friend.friend_id == user_id).first()
+        if him_to_me:
+            continue  # уже взаимка
+        u = db.query(User).filter(User.id == f.friend_id).first()
+        if u:
+            result.append({"id": u.id, "name": u.name})
+    return result
+
+
+@app.get("/friends")
+def friends_mutual(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    # только взаимные друзья + краткая статистика (награды/стрик/цели)
+    my = db.query(Friend.friend_id).filter(Friend.user_id == user_id).subquery()
+    mutual_ids = db.query(Friend.user_id).filter(
+        Friend.user_id.in_(my),
+        Friend.friend_id == user_id
+    ).subquery()
+
+    friends = db.query(User).filter(User.id.in_(mutual_ids)).all()
+
+    out = []
+    for u in friends:
+        # награды
+        ach_count = db.query(UserAchievement).filter(UserAchievement.user_id == u.id).count()
+
+        # цели done
+        goals_done = db.query(Goal).filter(Goal.user_id == u.id, Goal.status == "DONE").count()
+
+        # max streak
+        habits = db.query(Habit).filter(Habit.user_id == u.id).all()
+        max_streak = 0
+        for h in habits:
+            dates = [c.date for c in db.query(HabitCheckin).filter(HabitCheckin.habit_id == h.id).all()]
+            max_streak = max(max_streak, compute_current_streak(dates))
+
+        out.append({
+            "id": u.id,
+            "name": u.name,
+            "achievementsCount": ach_count,
+            "currentHabitStreak": max_streak,
+            "goalsCompleted": goals_done
+        })
+    return out
+
+
+@app.post("/friends/{friend_id}")
+def friends_add_or_accept(friend_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    # add = создать исходящий запрос, accept = создать ответный запрос -> взаимка
+    if friend_id == user_id:
+        raise HTTPException(400, "Cannot add yourself")
+
+    if not db.query(User).filter(User.id == friend_id).first():
+        raise HTTPException(404, "User not found")
+
+    exists = db.query(Friend).filter(Friend.user_id == user_id, Friend.friend_id == friend_id).first()
+    if exists:
+        return {"ok": True}
+
+    db.add(Friend(user_id=user_id, friend_id=friend_id))
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/friends/{friend_id}")
+def friends_remove_or_cancel(friend_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    # удаляет ТВОЮ связь user->friend (это и отмена исходящего запроса, и "удалить друга")
+    row = db.query(Friend).filter(Friend.user_id == user_id, Friend.friend_id == friend_id).first()
+    if row:
+        db.delete(row)
+        db.commit()
+    return {"ok": True}
+
+
+@app.delete("/habits/{habit_id}")
+def delete_habit(habit_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    h = db.query(Habit).filter_by(id=habit_id, user_id=user_id).first()
+    if not h:
+        raise HTTPException(404, "Habit not found")
+
+    # можно удалить чек-ины, чтобы не оставлять мусор
+    db.query(HabitCheckin).filter(HabitCheckin.habit_id == habit_id).delete()
+    db.delete(h)
+    db.commit()
+    return {"ok": True}
+
+@app.delete("/goals/{goal_id}")
+def delete_goal(goal_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    g = db.query(Goal).filter_by(id=goal_id, user_id=user_id).first()
+    if not g:
+        raise HTTPException(404, "Goal not found")
+
+    # если есть шаги
+    db.query(GoalStep).filter(GoalStep.goal_id == goal_id).delete()
+    db.delete(g)
+    db.commit()
+    return {"ok": True}
+
+@app.get("/templates/goals")
+def get_goal_templates(user_id: int = Depends(get_current_user_id)):
+    # user_id тут нужен только чтобы эндпоинт был защищён токеном, как у тебя всё остальное
+    return GOAL_TEMPLATES
+
+GOAL_TEMPLATES = [
+    {
+        "id": 1,
+        "title": "Пробежать 5 км",
+        "description": "Базовая цель на выносливость и дисциплину",
+        "category": "Здоровье",
+        "suggestedTarget": 5,
+        "suggestedUnit": "км",
+    },
+    {
+        "id": 2,
+        "title": "Прочитать 10 книг",
+        "description": "Цель на развитие и регулярное чтение",
+        "category": "Саморазвитие",
+        "suggestedTarget": 10,
+        "suggestedUnit": "книг",
+    },
+    {
+        "id": 3,
+        "title": "Тренироваться 12 раз",
+        "description": "Регулярные тренировки без перегруза",
+        "category": "Спорт",
+        "suggestedTarget": 12,
+        "suggestedUnit": "раз",
+    },
+]
+
+@app.get("/templates/goals")
+def get_goal_templates(
+    user_id: int = Depends(get_current_user_id)
+):
+    # user_id тут просто чтобы endpoint был защищён токеном
+    return GOAL_TEMPLATES
 
 
