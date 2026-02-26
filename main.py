@@ -76,6 +76,7 @@ class Goal(Base):
     deadline = Column(String, nullable=True)
     priority = Column(Integer, default=3)
     status = Column(String, default="ACTIVE")
+    show_in_profile = Column(Integer, default=0)
 
 class GoalStep(Base):
     __tablename__ = "goal_steps"
@@ -101,6 +102,7 @@ class GoalUpdateBody(BaseModel):
     deadline: str | None = None
     priority: int | None = None
     status: str | None = None
+    showInProfile : bool | None = None
 
 class GoalTemplateOut(BaseModel):
     id: int
@@ -152,7 +154,8 @@ GOAL_TEMPLATES: list[GoalTemplateOut] = [
 
 # ================= SCHEMAS =================
 
-
+class GoalProgressBody(BaseModel):
+    delta: int = 1  # насколько прибавить
 
 class RegisterBody(BaseModel):
     email: str
@@ -181,6 +184,7 @@ class GoalCreateBody(BaseModel):
     deadline: str | None = None
     priority: int = 3
     status: str = "ACTIVE"
+    showInProfile: bool = False
 
 class GoalStatusBody(BaseModel):
     status: str
@@ -279,7 +283,34 @@ def login(body: LoginBody, db: Session = Depends(get_db)):
 
 
 
+@app.put("/goals/{goal_id}/progress")
+def add_goal_progress(
+    goal_id: int,
+    body: GoalProgressBody,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    g = db.query(Goal).filter_by(id=goal_id, user_id=user_id).first()
+    if not g:
+        raise HTTPException(404, "Goal not found")
 
+    if body.delta <= 0:
+        raise HTTPException(400, "delta must be > 0")
+
+    # инкремент
+    g.progress_value = (g.progress_value or 0) + body.delta
+
+    # если есть targetValue — можно ограничить и/или автозавершать
+    if g.target_value is not None:
+        if g.progress_value >= g.target_value:
+            g.progress_value = g.target_value
+            # опционально: авто DONE
+            # prev_status = g.status
+            g.status = "DONE"
+
+    db.commit()
+    db.refresh(g)
+    return goal_to_dto(g)
 
 
 @app.put("/goals/{goal_id}")
@@ -300,6 +331,8 @@ def update_goal(goal_id: int, body: GoalUpdateBody,
     if body.deadline is not None: g.deadline = body.deadline
     if body.priority is not None: g.priority = body.priority
     if body.status is not None: g.status = body.status
+    if body.showInProfile is not None:
+        g.show_in_profile = 1 if body.showInProfile else 0
 
     db.commit()
 
@@ -423,6 +456,7 @@ def goal_to_dto(g: Goal) -> dict:
         "deadline": g.deadline,
         "priority": g.priority,
         "status": g.status,
+        "showInProfile": bool(g.show_in_profile)
     }
 
 def habit_to_dto(h: Habit) -> dict:
@@ -482,6 +516,7 @@ async def create_goal(
         deadline=body.deadline,
         priority=body.priority,
         status=body.status,
+        show_in_profile=1 if body.showInProfile else 0,
     )
 
     db.add(g)
@@ -504,10 +539,17 @@ def profile(user_id: int = Depends(get_current_user_id), db: Session = Depends(g
 
     achievements = db.query(UserAchievement).filter_by(user_id=user_id).all()
 
+    visible_goals = db.query(Goal).filter_bvisible_goals = (
+    db.query(Goal)
+      .filter(Goal.user_id == user_id, Goal.show_in_profile == 1)
+      .all()
+)
+
     return {
         "currentHabitStreak": max_streak,
         "goalsCompleted": goals_done,
-        "achievements": achievements
+        "achievements": achievements,
+        "goals": [goal_to_dto(g) for g in visible_goals],
     }
 @app.get("/users")
 def list_users(q: str | None = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -674,7 +716,7 @@ def friends_mutual(user_id: int = Depends(get_current_user_id), db: Session = De
             "goalsCompleted": goals_done
         })
     return out
-
+#видно цель не видно цель показывать, цели с этапами добавить,по количественым выбираем цель смотрим прогресс, в чт надо диаграммы
 
 @app.post("/friends/{friend_id}")
 def friends_add_or_accept(friend_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
